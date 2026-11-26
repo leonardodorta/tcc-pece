@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "DOM-SP pipeline - S3 data lake bucket, TLS-only policy and Athena workgroup"
+
+# Bucket de dados unico (bronze, prata, ouro e prefixos auxiliares), a policy TLS-only do
+# bucket e o Athena WorkGroup usado para consultar as camadas prata e ouro. O
+# CreateDataLakeBucket controla se a pilha cria o bucket ou reusa um que ja existe.
+
+Parameters:
+  Environment:
+    Type: String
+    Description: "Environment name used as suffix in all resource names"
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: "Days to keep objects under the athena-results/ prefix of the data lake bucket"
+
+  CreateDataLakeBucket:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "true creates the data lake bucket; false reuses an existing bucket of the same name"
+
+Conditions:
+  # Cria o bucket (com seu versionamento e ciclo de vida) somente quando pedido. A policy
+  # TLS-only nao usa esta condicao: ver DataLakeBucketPolicy.
+  CriarBucket: !Equals [!Ref CreateDataLakeBucket, "true"]
+
+Resources:
+
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Condition: CriarBucket
+    # Retain: apagar a pilha nao pode levar o dado do lago junto.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "domsp-${Environment}-lake-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: ExpireEphemeralPrefixes
+            Status: Enabled
+            # athena-results e descartavel: regenerado a cada consulta.
+            ExpirationInDays: !Ref LogRetentionDays
+            Prefix: athena-results/
+      Tags:
+        - Key: Project
+          Value: domsp
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Politica TLS-only: nega qualquer acesso que nao venha por HTTPS. Nao e condicional porque
+  # tambem deve se aplicar quando o bucket e reusado (CreateDataLakeBucket=false). `Bucket` usa
+  # o nome derivado por `!Sub`, e nao `!Ref DataLakeBucket`, pois o recurso do bucket pode nao
+  # existir nesse modo.
+  DataLakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Sub "domsp-${Environment}-lake-${AWS::AccountId}-${AWS::Region}"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::domsp-${Environment}-lake-${AWS::AccountId}-${AWS::Region}"
+              - !Sub "arn:${AWS::Partition}:s3:::domsp-${Environment}-lake-${AWS::AccountId}-${AWS::Region}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "domsp-${Environment}"
+      Description: "Query workgroup for the DOM-SP gold and silver tables"
+      State: ENABLED
+      # RecursiveDeleteOption true: sem ela o Athena recusa apagar um WorkGroup com historico
+      # de consulta e a pilha para em DELETE_FAILED.
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          # Nome derivado por !Sub, e nao !Ref, para valer tanto no bucket criado quanto no reusado.
+          OutputLocation: !Sub "s3://domsp-${Environment}-lake-${AWS::AccountId}-${AWS::Region}/athena-results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+Outputs:
+  DataLakeBucketName:
+    Description: "S3 bucket holding all pipeline data"
+    # Nome deterministico: vale tanto se o bucket foi criado quanto se foi reusado.
+    Value: !Sub "domsp-${Environment}-lake-${AWS::AccountId}-${AWS::Region}"
+  DataLakeBucketArn:
+    Description: "ARN of the data lake bucket"
+    Value: !Sub "arn:${AWS::Partition}:s3:::domsp-${Environment}-lake-${AWS::AccountId}-${AWS::Region}"
+  AthenaWorkGroupName:
+    Description: "Athena workgroup preconfigured with the result location"
+    Value: !Ref AthenaWorkGroup

@@ -1,0 +1,18 @@
+{
+  "Environment": "prod",
+  "WindowFrom": "2026-04-01",
+  "WindowTo": "2026-09-30",
+  "ProjectionStart": "2026-04-01",
+  "CreateDataLakeBucket": "false",
+  "WheelName": "domsp-1.0.2-py3-none-any.whl",
+  "ModelVersion": "1.0.0",
+  "ModelArtifactUri": "s3://<BUCKET-DO-LAGO>/model/1.0.0/model.tar.gz",
+  "InferenceImageUri": "763104351884.dkr.ecr.us-east-1.amazonaws.com/huggingface-pytorch-inference:2.3.0-transformers4.46.1-cpu-py311-ubuntu22.04",
+  "TransformInstanceType": "ml.c5.2xlarge",
+  "TransformInstanceCount": "4",
+  "FatiasModelo": "16",
+  "ModelServerWorkers": "4",
+  "ThreadsPerWorker": "2",
+  "ScheduleState": "DISABLED",
+  "QuickSightPrincipalArn": "arn:aws:quicksight:us-east-1:<ID-DA-CONTA>:user/default/<PERFIL>/<USUARIO>"
+}

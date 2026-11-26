@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "DOM-SP pipeline - IAM roles for Glue, Step Functions, EventBridge and SageMaker"
+
+# Os quatro papeis do pipeline (Glue, SageMaker, Step Functions, EventBridge), cada um com
+# acesso apenas aos recursos que sua etapa precisa.
+
+Parameters:
+  Environment:
+    Type: String
+  ArtifactBucket:
+    Type: String
+    Description: "Bucket holding templates, scripts and the wheel - read only for the jobs"
+  DataLakeBucketArn:
+    Type: String
+  DatabaseName:
+    Type: String
+
+Resources:
+
+  # ---- Glue: le artefato, le e escreve o lago inteiro, usa o catalogo ----
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "domsp-${Environment}-glue-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: DataLakeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadWriteDataLake
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                # Bucket inteiro, nao uma lista de prefixos: enumerar bronze/*, silver/*, gold/*
+                # falha nos marcadores `_$folder$` que o conector S3 do Hadoop cria.
+                Resource: !Sub "${DataLakeBucketArn}/*"
+              - Sid: ListDataLake
+                Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:GetBucketLocation"
+                Resource: !Ref DataLakeBucketArn
+              - Sid: ReadArtifacts
+                Effect: Allow
+                Action: "s3:GetObject"
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/*"
+              - Sid: ListArtifacts
+                Effect: Allow
+                Action: "s3:ListBucket"
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}"
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
+              - Sid: PublishMetrics
+                Effect: Allow
+                Action: "cloudwatch:PutMetricData"
+                # Cobre os dois alvos de PutMetricData (`Glue` e `AWS/Glue`); a acao nao
+                # aceita restricao por recurso, entao o Resource e "*" sem Condition de
+                # namespace.
+                Resource: "*"
+              - Sid: UseGlueCatalog
+                Effect: Allow
+                Action:
+                  - "glue:GetDatabase"
+                  - "glue:GetTable"
+                  - "glue:GetPartition"
+                  - "glue:GetPartitions"
+                  - "glue:BatchCreatePartition"
+                  - "glue:CreatePartition"
+                  - "glue:UpdatePartition"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}/*"
+
+  # ---- SageMaker: le o modelo e o model-input, escreve o model-output ----
+  SageMakerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "domsp-${Environment}-sagemaker-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+      Policies:
+        - PolicyName: BatchTransformAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadModelAndInput
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                # Modelo (model/) e entrada (model-input/) ficam no lago; o container tambem
+                # escreve o resultado em model-output/, entao bucket inteiro para leitura e escrita.
+                Resource:
+                  - !Ref DataLakeBucketArn
+                  - !Sub "${DataLakeBucketArn}/*"
+              - Sid: WriteModelOutput
+                Effect: Allow
+                Action: "s3:PutObject"
+                Resource: !Sub "${DataLakeBucketArn}/*"
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/*"
+              - Sid: PublishMetrics
+                Effect: Allow
+                Action: "cloudwatch:PutMetricData"
+                Resource: "*"
+
+  # ---- Step Functions: roda os jobs Glue, cria o Batch Transform, passa o papel do SageMaker ----
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "domsp-${Environment}-states-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+      Policies:
+        - PolicyName: RunPipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunAndWatchGlueJobs
+                Effect: Allow
+                Action:
+                  - "glue:StartJobRun"
+                  - "glue:GetJobRun"
+                  - "glue:GetJobRuns"
+                  - "glue:BatchStopJobRun"
+                Resource: !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/domsp-${Environment}-*"
+              - Sid: RunBatchTransform
+                Effect: Allow
+                Action:
+                  - "sagemaker:CreateTransformJob"
+                  - "sagemaker:DescribeTransformJob"
+                  - "sagemaker:StopTransformJob"
+                  - "sagemaker:AddTags"
+                Resource: !Sub "arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:transform-job/domsp-${Environment}-*"
+              - Sid: PassSageMakerRole
+                Effect: Allow
+                # Step Functions cria o Transform Job COM o papel do SageMaker, por isso
+                # precisa poder passa-lo; condicionado ao servico do SageMaker.
+                Action: "iam:PassRole"
+                Resource: !GetAtt SageMakerRole.Arn
+                Condition:
+                  StringEquals:
+                    "iam:PassedToService": sagemaker.amazonaws.com
+              - Sid: WatchTransformEvents
+                Effect: Allow
+                # startTransformJob.sync usa uma regra gerenciada do EventBridge para saber
+                # quando o job termina; o Resource e o ARN dessa regra.
+                Action:
+                  - "events:PutTargets"
+                  - "events:PutRule"
+                  - "events:DescribeRule"
+                Resource: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForSageMakerTransformJobsRule"
+              - Sid: DeliverExecutionLogs
+                Effect: Allow
+                # Entrega de log de maquina de estados e gerenciada; a API de log delivery
+                # exige recurso "*".
+                Action:
+                  - "logs:CreateLogDelivery"
+                  - "logs:GetLogDelivery"
+                  - "logs:UpdateLogDelivery"
+                  - "logs:DeleteLogDelivery"
+                  - "logs:ListLogDeliveries"
+                  - "logs:PutResourcePolicy"
+                  - "logs:DescribeResourcePolicies"
+                  - "logs:DescribeLogGroups"
+                Resource: "*"
+
+  # ---- EventBridge: apenas dispara a maquina de estados ----
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "domsp-${Environment}-scheduler-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+      Policies:
+        - PolicyName: StartPipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StartStateMachine
+                Effect: Allow
+                Action: "states:StartExecution"
+                # Por nome e nao por ARN: o ARN da maquina de estados vem da pilha de
+                # orquestracao, criada depois desta, e referencia-lo aqui criaria dependencia
+                # circular entre as pilhas (a pilha de orquestracao consome o ARN deste papel).
+                Resource: !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:domsp-${Environment}-pipeline"
+
+Outputs:
+  GlueRoleArn:
+    Value: !GetAtt GlueRole.Arn
+  SageMakerRoleArn:
+    Value: !GetAtt SageMakerRole.Arn
+  StateMachineRoleArn:
+    Value: !GetAtt StateMachineRole.Arn
+  SchedulerRoleArn:
+    Value: !GetAtt SchedulerRole.Arn

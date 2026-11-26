@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "DOM-SP contract extraction pipeline - root stack over storage, iam, catalog, processing, model, orchestration and the optional dashboard"
+
+# ---------------------------------------------------------------------------
+# A PILHA RAIZ: orquestra as pilhas aninhadas de storage, iam, catalog, processing, model,
+# dashboard e orchestration do pipeline de extracao de contratos DOM-SP.
+#
+# A ORDEM das pilhas aninhadas e dada pelo FLUXO DE PARAMETROS, e nao por DependsOn: cada
+# pilha consome os outputs (ARNs, nomes) das anteriores via !GetAtt, o que torna a dependencia
+# explicita no template. A unica excecao e a pilha Dashboard, que declara DependsOn: Catalog
+# (ver o comentario no recurso), pois nao consome nenhum output do Catalog.
+#
+# As Description deste template sao ASCII por convencao.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  ArtifactBucket:
+    Type: String
+    Description: "Existing S3 bucket holding the nested templates, the jobs and the wheel"
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: "Environment name used as suffix in all resource names"
+
+  ProjectionStart:
+    Type: String
+    Default: "2024-01-01"
+    Description: "First edition date the partition projection covers, format yyyy-MM-dd"
+
+  WindowFrom:
+    Type: String
+    Default: "tudo"
+    Description: "Window start: yyyy-MM-dd, tudo for no bound, or ultimos:N for the last N days. The download job needs a concrete date or ultimos:N here and a concrete date in WindowTo; tudo is only valid for the stages that read the existing lake"
+
+  WindowTo:
+    Type: String
+    Default: "tudo"
+    Description: "Window end: yyyy-MM-dd or tudo for no bound. The download job requires a concrete date here, see WindowFrom"
+
+  WheelName:
+    Type: String
+    Default: "domsp-1.0.0-py3-none-any.whl"
+    Description: "Filename of the domsp wheel under s3://<artifact>/wheel/"
+
+  ModelArtifactUri:
+    Type: String
+    Default: ""
+    Description: "S3 URI of model.tar.gz. Empty means the pipeline runs deterministic only"
+
+  InferenceImageUri:
+    Type: String
+    Default: ""
+    Description: "ECR URI of the inference container for the region, required only with a model"
+
+  ModelVersion:
+    Type: String
+    Default: "nenhum"
+    Description: "Version label written into model_version, or nenhum when no model ran"
+
+  TransformInstanceType:
+    Type: String
+    Default: "ml.m5.xlarge"
+    Description: "CPU instance for Batch Transform - more vCPU shortens the run, no GPU is used"
+
+  ModelServerWorkers:
+    Type: String
+    Default: "4"
+    Description: "Model server workers AND concurrent transforms - one knob, the two must match"
+
+  QuickSightPrincipalArn:
+    Type: String
+    Default: ""
+    Description: "QuickSight user ARN. Empty skips the dashboard - it needs a subscription"
+
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: "Daily rule state. Set DISABLED to keep the account from running on its own"
+
+  TransformInstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 16
+    Description: "Batch Transform instances. Needs FatiasModelo >= this, or they sit idle"
+
+  FatiasModelo:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 64
+    Description: "Objects the residue is split into. Use ~4x the instance count to balance"
+
+  ThreadsPerWorker:
+    Type: String
+    Default: "2"
+    Description: "Torch threads per worker. workers x threads should not exceed the instance vCPU"
+
+  CreateDataLakeBucket:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "true creates the data lake bucket; false reuses an existing bucket of same name"
+
+Conditions:
+  HasModel: !Not [!Equals [!Ref ModelArtifactUri, ""]]
+  # O painel e condicional porque depende de uma subscricao do QuickSight, que nao e recurso
+  # de CloudFormation e nao existe em toda conta.
+  HasQuickSight: !Not [!Equals [!Ref QuickSightPrincipalArn, ""]]
+
+Resources:
+
+  Storage:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.${AWS::Region}.amazonaws.com/${ArtifactBucket}/cloudformation/01-storage.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        CreateDataLakeBucket: !Ref CreateDataLakeBucket
+      Tags:
+        - Key: Project
+          Value: domsp
+
+  Iam:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.${AWS::Region}.amazonaws.com/${ArtifactBucket}/cloudformation/02-iam.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        ArtifactBucket: !Ref ArtifactBucket
+        DataLakeBucketArn: !GetAtt Storage.Outputs.DataLakeBucketArn
+        DatabaseName: !Sub "domsp_${Environment}"
+      Tags:
+        - Key: Project
+          Value: domsp
+
+  Catalog:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.${AWS::Region}.amazonaws.com/${ArtifactBucket}/cloudformation/03-catalog.yaml"
+      Parameters:
+        DataLakeBucketName: !GetAtt Storage.Outputs.DataLakeBucketName
+        DatabaseName: !Sub "domsp_${Environment}"
+        ProjectionStart: !Ref ProjectionStart
+      Tags:
+        - Key: Project
+          Value: domsp
+
+  Processing:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.${AWS::Region}.amazonaws.com/${ArtifactBucket}/cloudformation/04-processing.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        ArtifactBucket: !Ref ArtifactBucket
+        DataLakeBucketName: !GetAtt Storage.Outputs.DataLakeBucketName
+        DatabaseName: !Sub "domsp_${Environment}"
+        GlueRoleArn: !GetAtt Iam.Outputs.GlueRoleArn
+        WheelName: !Ref WheelName
+        WindowFrom: !Ref WindowFrom
+        WindowTo: !Ref WindowTo
+        FatiasModelo: !Ref FatiasModelo
+      Tags:
+        - Key: Project
+          Value: domsp
+
+  Model:
+    Type: AWS::CloudFormation::Stack
+    # A pilha do modelo e sempre criada, mas o RECURSO dentro dela e condicional: com
+    # ModelArtifactUri vazio ela nao cria nada e devolve ModelName=none.
+    Properties:
+      TemplateURL: !Sub "https://s3.${AWS::Region}.amazonaws.com/${ArtifactBucket}/cloudformation/05-model.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        ModelArtifactUri: !Ref ModelArtifactUri
+        InferenceImageUri: !Ref InferenceImageUri
+        SageMakerRoleArn: !GetAtt Iam.Outputs.SageMakerRoleArn
+        ModelServerWorkers: !Ref ModelServerWorkers
+        ThreadsPerWorker: !Ref ThreadsPerWorker
+      Tags:
+        - Key: Project
+          Value: domsp
+
+  Dashboard:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasQuickSight
+    # Excecao ao fluxo por parametros: o Dashboard nao consome outputs do Catalog, mas os
+    # conjuntos do QuickSight referenciam as tabelas do Glue pelo nome. DependsOn garante que
+    # as tabelas existam antes, pois a criacao do DataSet resolve o esquema.
+    DependsOn: Catalog
+    Properties:
+      TemplateURL: !Sub "https://s3.${AWS::Region}.amazonaws.com/${ArtifactBucket}/cloudformation/07-dashboard.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        DatabaseName: !Sub "domsp_${Environment}"
+        AthenaWorkGroupName: !GetAtt Storage.Outputs.AthenaWorkGroupName
+        QuickSightPrincipalArn: !Ref QuickSightPrincipalArn
+      Tags:
+        - Key: Project
+          Value: domsp
+
+  Orchestration:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.${AWS::Region}.amazonaws.com/${ArtifactBucket}/cloudformation/06-orchestration.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        StateMachineRoleArn: !GetAtt Iam.Outputs.StateMachineRoleArn
+        SchedulerRoleArn: !GetAtt Iam.Outputs.SchedulerRoleArn
+        DataLakeBucketName: !GetAtt Storage.Outputs.DataLakeBucketName
+        DownloadJobName: !GetAtt Processing.Outputs.DownloadJobName
+        BronzeJobName: !GetAtt Processing.Outputs.BronzeJobName
+        SilverJobName: !GetAtt Processing.Outputs.SilverJobName
+        ApplyInferenceJobName: !GetAtt Processing.Outputs.ApplyInferenceJobName
+        GoldJobName: !GetAtt Processing.Outputs.GoldJobName
+        ModelName: !GetAtt Model.Outputs.ModelName
+        ModelVersion: !If [HasModel, !Ref ModelVersion, "nenhum"]
+        TransformInstanceType: !Ref TransformInstanceType
+        ModelServerWorkers: !Ref ModelServerWorkers
+        TransformInstanceCount: !Ref TransformInstanceCount
+        ScheduleState: !Ref ScheduleState
+      Tags:
+        - Key: Project
+          Value: domsp
+
+Outputs:
+  DataLakeBucketName:
+    Description: "S3 bucket holding all pipeline data"
+    Value: !GetAtt Storage.Outputs.DataLakeBucketName
+
+  DatabaseName:
+    Description: "Glue database to query from Athena"
+    Value: !Sub "domsp_${Environment}"
+
+  AthenaWorkGroupName:
+    Description: "Athena workgroup preconfigured with the result location"
+    Value: !GetAtt Storage.Outputs.AthenaWorkGroupName
+
+  StateMachineArn:
+    Description: "ARN of the pipeline state machine"
+    Value: !GetAtt Orchestration.Outputs.StateMachineArn
+
+  StartCommand:
+    Description: "Command to start one pipeline run immediately"
+    Value: !Sub
+      - "aws stepfunctions start-execution --state-machine-arn ${Arn}"
+      - Arn: !GetAtt Orchestration.Outputs.StateMachineArn
+
+  DashboardUrl:
+    Description: "QuickSight dashboard, or the string none when no principal was given"
+    Value: !If
+      - HasQuickSight
+      - !GetAtt Dashboard.Outputs.DashboardUrl
+      - "none"

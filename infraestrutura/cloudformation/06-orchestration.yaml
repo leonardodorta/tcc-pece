@@ -1,0 +1,262 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "DOM-SP pipeline - Step Functions state machine and the EventBridge daily trigger"
+
+# ---------------------------------------------------------------------------
+# Orquestra o pipeline com Step Functions: download -> bronze -> silver, depois (se houver
+# modelo) Batch Transform sobre o residuo -> apply_inference -> gold; sem modelo, pula direto
+# para apply_inference. EventBridge dispara a execucao diaria.
+#
+# O estado do modelo tem CATCH que segue para apply_inference/gold: a ausencia ou a falha do
+# modelo nao pode impedir as camadas deterministicas.
+#
+# O nome do Transform Job e derivado do nome da execucao e truncado no primeiro underscore: o
+# SageMaker exige no maximo 63 caracteres sem underscore, e o nome de execucao do EventBridge
+# (dois UUIDs unidos por underscore) excede esse limite com o prefixo.
+#
+# O paralelismo tem dois eixos independentes: dentro de uma instancia,
+# `MaxConcurrentTransforms` x `SAGEMAKER_MODEL_SERVER_WORKERS`; entre instancias,
+# `InstanceCount`, que so ajuda se a entrada tiver varios objetos S3 (o Batch Transform
+# distribui por objeto, nao por linha) — por isso `FatiasModelo` reparte o residuo em N
+# objetos no silver.
+#
+# A unidade de invocacao e o ato (`BatchStrategy=SingleRecord`): cada requisicao ao container
+# carrega um unico registro. `ModelClientConfig` nao e definido neste template.
+#
+# As Description deste template sao ASCII por convencao.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  Environment:
+    Type: String
+  StateMachineRoleArn:
+    Type: String
+  SchedulerRoleArn:
+    Type: String
+  DataLakeBucketName:
+    Type: String
+  DownloadJobName:
+    Type: String
+  BronzeJobName:
+    Type: String
+  SilverJobName:
+    Type: String
+  ApplyInferenceJobName:
+    Type: String
+  GoldJobName:
+    Type: String
+  ModelName:
+    Type: String
+    Default: "none"
+    Description: "SageMaker model name, or the string none when no model exists yet"
+  ModelVersion:
+    Type: String
+    Default: "nenhum"
+    Description: "Version label written into model_version, or nenhum when no model ran"
+  TransformInstanceType:
+    Type: String
+    Default: "ml.m5.xlarge"
+    Description: "CPU instance for Batch Transform - no GPU, inference runs on CPU"
+  ModelServerWorkers:
+    Type: String
+    Default: "4"
+    Description: "Concurrent transforms, kept equal to the model server workers of 05-model"
+  TransformInstanceCount:
+    Type: Number
+    Default: 1
+    Description: "Batch Transform instances. Only helps when the input has >= this many objects"
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: "Daily rule state. DISABLED creates the rule without firing it - see the note on DailyTrigger"
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+Conditions:
+  # Quando ha modelo, a maquina de estados inclui o passo de Batch Transform. Sem modelo, ela
+  # vai de silver direto para apply_inference.
+  HasModel: !Not [!Equals [!Ref ModelName, "none"]]
+
+Resources:
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # O prefixo `/aws/vendedlogs/` e exigido pelo Step Functions para entrega gerenciada.
+      LogGroupName: !Sub "/aws/vendedlogs/states/domsp-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  PipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "domsp-${Environment}-pipeline"
+      RoleArn: !Ref StateMachineRoleArn
+      StateMachineType: STANDARD
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt LogGroup.Arn
+      DefinitionString: !If
+        - HasModel
+        - !Sub |
+            {
+              "Comment": "DOM-SP extraction pipeline with model: download, bronze, silver, Batch Transform over the residual, apply inference, gold",
+              "StartAt": "Download",
+              "States": {
+                "Download": {
+                  "Type": "Task",
+                  "Comment": "Weekends and holidays have no edition (art. 5 Decreto 62.177/2023), so an empty day is not a failure",
+                  "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+                  "Parameters": { "JobName": "${DownloadJobName}" },
+                  "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 60, "MaxAttempts": 2, "BackoffRate": 2.0 } ],
+                  "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" } ],
+                  "Next": "Bronze"
+                },
+                "Bronze": {
+                  "Type": "Task",
+                  "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+                  "Parameters": { "JobName": "${BronzeJobName}", "Arguments": { "--run_id.$": "$$.Execution.Name" } },
+                  "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 30, "MaxAttempts": 1, "BackoffRate": 2.0 } ],
+                  "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" } ],
+                  "Next": "Silver"
+                },
+                "Silver": {
+                  "Type": "Task",
+                  "Comment": "Triage plus the three deterministic layers, and writes the model-input JSONL from the residual",
+                  "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+                  "Parameters": { "JobName": "${SilverJobName}", "Arguments": { "--run_id.$": "$$.Execution.Name" } },
+                  "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 30, "MaxAttempts": 1, "BackoffRate": 2.0 } ],
+                  "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" } ],
+                  "Next": "BatchTransform"
+                },
+                "BatchTransform": {
+                  "Type": "Task",
+                  "Comment": "SageMaker Batch Transform over the residual only, JSONL, SplitType Line. No persistent endpoint",
+                  "Resource": "arn:${AWS::Partition}:states:::sagemaker:createTransformJob.sync",
+                  "Parameters": {
+                    "TransformJobName.$": "States.Format('domsp-${Environment}-{}', States.ArrayGetItem(States.StringSplit($$.Execution.Name, '_'), 0))",
+                    "ModelName": "${ModelName}",
+                    "TransformInput": {
+                      "DataSource": { "S3DataSource": { "S3DataType": "S3Prefix", "S3Uri": "s3://${DataLakeBucketName}/model-input/" } },
+                      "ContentType": "application/jsonlines",
+                      "SplitType": "Line"
+                    },
+                    "TransformOutput": {
+                      "S3OutputPath": "s3://${DataLakeBucketName}/model-output/",
+                      "Accept": "application/jsonlines",
+                      "AssembleWith": "Line"
+                    },
+                    "TransformResources": { "InstanceType": "${TransformInstanceType}", "InstanceCount": ${TransformInstanceCount} },
+                    "BatchStrategy": "SingleRecord",
+                    "MaxPayloadInMB": 1,
+                    "MaxConcurrentTransforms": ${ModelServerWorkers}
+                  },
+                  "Catch": [ {
+                    "Comment": "The absence or failure of the model cannot stop the deterministic layers. On any error the run continues to apply inference, which handles an empty model-output as no inference",
+                    "ErrorEquals": ["States.ALL"], "Next": "ApplyInference", "ResultPath": "$.modelError"
+                  } ],
+                  "Next": "ApplyInference"
+                },
+                "ApplyInference": {
+                  "Type": "Task",
+                  "Comment": "Runs the model output through the same name gate as the deterministic layers, then consolidates contract-final without overwriting contract",
+                  "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+                  "Parameters": { "JobName": "${ApplyInferenceJobName}", "Arguments": { "--run_id.$": "$$.Execution.Name", "--model_version": "${ModelVersion}" } },
+                  "Catch": [ {
+                    "Comment": "A failure here still leaves the deterministic silver intact. Gold can be built from contract, so the run continues",
+                    "ErrorEquals": ["States.ALL"], "Next": "Gold", "ResultPath": "$.inferenceError"
+                  } ],
+                  "Next": "Gold"
+                },
+                "Gold": {
+                  "Type": "Task",
+                  "Comment": "Aggregates by supplier and agency, and writes the coverage metrics with Wilson intervals",
+                  "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+                  "Parameters": { "JobName": "${GoldJobName}", "Arguments": { "--run_id.$": "$$.Execution.Name", "--model_version": "${ModelVersion}" } },
+                  "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 30, "MaxAttempts": 1, "BackoffRate": 2.0 } ],
+                  "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" } ],
+                  "Next": "Succeeded"
+                },
+                "Succeeded": { "Type": "Succeed" },
+                "Failed": { "Type": "Fail", "Error": "PipelineFailed", "Cause": "A stage failed. The execution history names the Glue job run, and the job log has the Python traceback" }
+              }
+            }
+        - !Sub |
+            {
+              "Comment": "DOM-SP extraction pipeline without model: download, bronze, silver, apply inference (no model output), gold. The deterministic layers stand alone",
+              "StartAt": "Download",
+              "States": {
+                "Download": {
+                  "Type": "Task",
+                  "Comment": "Weekends and holidays have no edition (art. 5 Decreto 62.177/2023), so an empty day is not a failure",
+                  "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+                  "Parameters": { "JobName": "${DownloadJobName}" },
+                  "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 60, "MaxAttempts": 2, "BackoffRate": 2.0 } ],
+                  "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" } ],
+                  "Next": "Bronze"
+                },
+                "Bronze": {
+                  "Type": "Task",
+                  "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+                  "Parameters": { "JobName": "${BronzeJobName}", "Arguments": { "--run_id.$": "$$.Execution.Name" } },
+                  "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 30, "MaxAttempts": 1, "BackoffRate": 2.0 } ],
+                  "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" } ],
+                  "Next": "Silver"
+                },
+                "Silver": {
+                  "Type": "Task",
+                  "Comment": "Triage plus the three deterministic layers. Still writes model-input, harmless when no model consumes it",
+                  "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+                  "Parameters": { "JobName": "${SilverJobName}", "Arguments": { "--run_id.$": "$$.Execution.Name" } },
+                  "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 30, "MaxAttempts": 1, "BackoffRate": 2.0 } ],
+                  "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" } ],
+                  "Next": "ApplyInference"
+                },
+                "ApplyInference": {
+                  "Type": "Task",
+                  "Comment": "With no model-output present, this consolidates contract-final as a copy of the deterministic contract",
+                  "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+                  "Parameters": { "JobName": "${ApplyInferenceJobName}", "Arguments": { "--run_id.$": "$$.Execution.Name", "--model_version": "${ModelVersion}" } },
+                  "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "Gold", "ResultPath": "$.inferenceError" } ],
+                  "Next": "Gold"
+                },
+                "Gold": {
+                  "Type": "Task",
+                  "Comment": "Aggregates by supplier and agency, and writes the coverage metrics with Wilson intervals",
+                  "Resource": "arn:${AWS::Partition}:states:::glue:startJobRun.sync",
+                  "Parameters": { "JobName": "${GoldJobName}", "Arguments": { "--run_id.$": "$$.Execution.Name", "--model_version": "${ModelVersion}" } },
+                  "Retry": [ { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 30, "MaxAttempts": 1, "BackoffRate": 2.0 } ],
+                  "Catch": [ { "ErrorEquals": ["States.ALL"], "Next": "Failed", "ResultPath": "$.error" } ],
+                  "Next": "Succeeded"
+                },
+                "Succeeded": { "Type": "Succeed" },
+                "Failed": { "Type": "Fail", "Error": "PipelineFailed", "Cause": "A stage failed. The execution history names the Glue job run, and the job log has the Python traceback" }
+              }
+            }
+
+  DailyTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "domsp-${Environment}-daily"
+      Description: "Starts the extraction pipeline once every 24 hours. Never triggers training"
+      # `rate(24 hours)` e nao `cron`: o rate e relativo ao momento da criacao da regra e nao
+      # fixa um horario UTC do dia, como faria um cron.
+      ScheduleExpression: "rate(24 hours)"
+      # O estado e parametro, pois a regra dispara na criacao (nao 24h depois): todo deploy
+      # inicia uma execucao imediata, e manter o estado desejado declarado evita um ajuste
+      # manual na regra apos cada deploy.
+      State: !Ref ScheduleState
+      Targets:
+        - Id: PipelineTarget
+          Arn: !Ref PipelineStateMachine
+          RoleArn: !Ref SchedulerRoleArn
+
+Outputs:
+  StateMachineArn:
+    Description: "ARN of the pipeline state machine"
+    Value: !Ref PipelineStateMachine
+  LogGroupName:
+    Value: !Ref LogGroup

@@ -1,0 +1,730 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "DOM-SP pipeline - Glue database and the external tables, one per lake dataset"
+
+# O catalogo Glue: um database e uma tabela por conjunto de dados do lago (bronze, prata e
+# ouro), com particionamento por data via projecao. Gerado por scripts/gerar_catalogo.py a
+# partir do esquema unico (esquema.colunas_catalogo) - nao editar a mao.
+
+Parameters:
+  DataLakeBucketName:
+    Type: String
+  DatabaseName:
+    Type: String
+  ProjectionStart:
+    Type: String
+    Default: "2024-01-01"
+    Description: "First edition date the partition projection covers, format yyyy-MM-dd"
+
+Resources:
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref DatabaseName
+        Description: "DOM-SP contract extraction - bronze, silver and gold layers"
+        LocationUri: !Sub "s3://${DataLakeBucketName}/"
+
+  BronzePublicationTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: bronze_publication
+        Description: "Publicação do DOM-SP como a fonte devolveu, uma linha por publicação, HTML intocado. Imutável por força do art. 12 e § 2º do Decreto 62.177/2023."
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: date
+            Comment: "data da EDIÇÃO em que a publicação saiu — não a da assinatura. É a chave de partição e de reprocessamento"
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+          "projection.enabled": "true"
+          "projection.dt.type": "date"
+          "projection.dt.format": "yyyy-MM-dd"
+          "projection.dt.range": !Sub "${ProjectionStart},NOW"
+          "projection.dt.interval": "1"
+          "projection.dt.interval.unit": "DAYS"
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucketName}/bronze/publication/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: publication_id
+              Type: string
+              Comment: "identificador da publicação na fonte, ou SHA-256 do corpo quando a fonte não o declara"
+            - Name: edition_date
+              Type: string
+              Comment: "data da edição como a fonte a imprimiu, sem normalizar"
+            - Name: edition_number
+              Type: string
+              Comment: "número da edição, quando a fonte o declara"
+            - Name: section
+              Type: string
+              Comment: "caderno em que a publicação saiu; o art. 13, § único do Decreto 62.177/2023 lista sete, e o V é Negócios"
+            - Name: agency
+              Type: string
+              Comment: "órgão publicador, como declarado pela fonte"
+            - Name: title
+              Type: string
+              Comment: "série do ato, o campo que a fonte chama de 'serie'"
+            - Name: body_html
+              Type: string
+              Comment: "corpo da publicação em HTML, exatamente como a fonte devolveu: sem limpeza, sem normalizar espaço, sem decodificar entidade"
+            - Name: encoding_regime
+              Type: string
+              Comment: "regime de codificação detectado na edição: 'direto' quando o UTF-8 veio correto, 'dupla' quando veio gravado e relido como latin-1 e foi desfeito"
+
+  SilverContractTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: silver_contract
+        Description: "Ato de contratação extraído pelas camadas determinísticas, uma linha por ato, tipado, com proveniência por campo. Nunca reescrito pelo modelo."
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: date
+            Comment: "data da EDIÇÃO em que a publicação saiu — não a da assinatura. É a chave de partição e de reprocessamento"
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+          "projection.enabled": "true"
+          "projection.dt.type": "date"
+          "projection.dt.format": "yyyy-MM-dd"
+          "projection.dt.range": !Sub "${ProjectionStart},NOW"
+          "projection.dt.interval": "1"
+          "projection.dt.interval.unit": "DAYS"
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucketName}/silver/contract/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: contract_id
+              Type: string
+              Comment: "SHA-256 truncado da identidade canônica do ato; estável entre reexecuções"
+            - Name: publication_id
+              Type: string
+              Comment: "liga de volta a bronze_publication"
+            - Name: edition_date
+              Type: date
+              Comment: "data da edição, normalizada"
+            - Name: agency
+              Type: string
+              Comment: "órgão contratante"
+            - Name: act_kind
+              Type: string
+              Comment: "espécie do ato. Valores: contrato, aditivo, doacao, apostilamento, ata_registro_preco, penalidade, empenho, convenio, termo_colaboracao, termo_fomento, acordo_cooperacao, rescisao, autorizacao_uso"
+            - Name: financial_nature
+              Type: string
+              Comment: "natureza financeira do ato — o que decide se o valor pode somar. Valores: gasto_efetivo, reserva_preco, repasse, alteracao, nao_gasto"
+            - Name: is_annulment
+              Type: boolean
+              Comment: "o ato anula outro ato; um valor anulado nunca foi gasto"
+            - Name: is_republication
+              Type: boolean
+              Comment: "o ato republica outro; o art. 12, § 2º do decreto manda que revisão seja nova publicação, então republicação não é correção e sim linha nova"
+            - Name: contractor_name
+              Type: string
+              Comment: "parte contratada, validada pela porta única de nome"
+            - Name: contractor_tax_id
+              Type: string
+              Comment: "CNPJ ou CPF só com dígitos, com dígito verificador conferido pelo módulo 11"
+            - Name: object
+              Type: string
+              Comment: "objeto contratado como a fonte o escreveu, truncado em 2.000 caracteres; determinístico, nunca inferido por modelo"
+            - Name: contract_number
+              Type: string
+              Comment: "número do contrato ou do ajuste"
+            - Name: process_number
+              Type: string
+              Comment: "número do processo administrativo"
+            - Name: amount_brl
+              Type: decimal(18,2)
+              Comment: "valor em reais. NÃO somar sem o filtro de is_summable"
+            - Name: amount_magnitude
+              Type: string
+              Comment: "grandeza semântica do valor lido — total vence mensal e unitário na eleição. Valores: total, estimado, anual, mensal, unitario, parcela, penalidade, saldo, indefinido"
+            - Name: is_summable
+              Type: boolean
+              Comment: "o valor satisfaz a regra financeira: natureza gasto efetivo, grandeza total ou estimada, e ato não anulado. Aditivo e apostilamento têm natureza alteracao e não são somáveis"
+            - Name: summability_reason
+              Type: string
+              Comment: "por que o valor não pode somar, quando não pode. Valores: somavel, sem_valor, natureza_nao_somavel, grandeza_nao_somavel, anulado"
+            - Name: signature_date
+              Type: date
+              Comment: "data de assinatura; nula quando a fonte não declarou OU quando a data lida caiu fora da faixa de plausibilidade — a proveniência distingue os dois casos"
+            - Name: term_months
+              Type: int
+              Comment: "prazo normalizado em meses; dias convertidos pela regra declarada de 30"
+            - Name: legal_basis
+              Type: string
+              Comment: "artigo citado da Lei 14.133/2021, quando a fonte o declara"
+            - Name: field_provenance
+              Type: map<string,string>
+              Comment: "de que camada veio cada campo preenchido. Sem este mapa a cobertura por camada não é recalculável"
+            - Name: rule_version
+              Type: string
+              Comment: "versão do pacote domsp que produziu a linha; muda quando a regra muda"
+            - Name: model_version
+              Type: string
+              Comment: "versão do modelo que participou da linha, ou 'nenhum' quando nenhum participou"
+            - Name: run_id
+              Type: string
+              Comment: "identificador da execução da máquina de estados que produziu a linha"
+            - Name: source_hash
+              Type: string
+              Comment: "SHA-256 do HTML de origem; muda se a fonte republicar conteúdo diferente"
+            - Name: processed_at
+              Type: timestamp
+              Comment: "instante UTC em que a linha foi gravada"
+
+  SilverDiscardTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: silver_discard
+        Description: "Publicação recusada na triagem, com o motivo e o estágio da decisão. Existe para que o descarte seja auditável: toda publicação recusada fica registrada e não desaparece em silêncio."
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: date
+            Comment: "data da EDIÇÃO em que a publicação saiu — não a da assinatura. É a chave de partição e de reprocessamento"
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+          "projection.enabled": "true"
+          "projection.dt.type": "date"
+          "projection.dt.format": "yyyy-MM-dd"
+          "projection.dt.range": !Sub "${ProjectionStart},NOW"
+          "projection.dt.interval": "1"
+          "projection.dt.interval.unit": "DAYS"
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucketName}/silver/discard/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: publication_id
+              Type: string
+              Comment: "a publicação recusada"
+            - Name: section
+              Type: string
+              Comment: "caderno"
+            - Name: title
+              Type: string
+              Comment: "série"
+            - Name: reason
+              Type: string
+              Comment: "por que foi recusada. Valores: caderno_fora_de_escopo, veiculo_fora_de_escopo, serie_de_licitacao, serie_de_ruido, sem_palavra_confirmadora, sem_atos_publicados"
+            - Name: stage
+              Type: string
+              Comment: "em que estágio a recusa foi decidida; 'metadado' significa que não foi preciso abrir o HTML. Valores: metadado, texto"
+            - Name: rule_version
+              Type: string
+              Comment: "versão do pacote domsp que produziu a linha; muda quando a regra muda"
+            - Name: model_version
+              Type: string
+              Comment: "versão do modelo que participou da linha, ou 'nenhum' quando nenhum participou"
+            - Name: run_id
+              Type: string
+              Comment: "identificador da execução da máquina de estados que produziu a linha"
+            - Name: source_hash
+              Type: string
+              Comment: "SHA-256 do HTML de origem; muda se a fonte republicar conteúdo diferente"
+            - Name: processed_at
+              Type: timestamp
+              Comment: "instante UTC em que a linha foi gravada"
+
+  SilverResidualTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: silver_residual
+        Description: "Ato cuja parte contratada as camadas determinísticas não resolveram. É a entrada do modelo, e a única."
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: date
+            Comment: "data da EDIÇÃO em que a publicação saiu — não a da assinatura. É a chave de partição e de reprocessamento"
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+          "projection.enabled": "true"
+          "projection.dt.type": "date"
+          "projection.dt.format": "yyyy-MM-dd"
+          "projection.dt.range": !Sub "${ProjectionStart},NOW"
+          "projection.dt.interval": "1"
+          "projection.dt.interval.unit": "DAYS"
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucketName}/silver/residual/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: contract_id
+              Type: string
+              Comment: "o ato sem parte contratada"
+            - Name: publication_id
+              Type: string
+              Comment: "liga de volta ao bronze, de onde vem o texto"
+            - Name: reason
+              Type: string
+              Comment: "por que nenhuma camada determinística resolveu. Valores: sem_campo_no_formulario, sem_rotulo_na_prosa, recusado_na_limpeza"
+            - Name: target_text
+              Type: string
+              Comment: "o texto que o modelo deve ler: a prosa recortada, SEM o formulário. É o mesmo recorte que o gabarito usa como entrada"
+            - Name: rule_version
+              Type: string
+              Comment: "versão do pacote domsp que produziu a linha; muda quando a regra muda"
+            - Name: model_version
+              Type: string
+              Comment: "versão do modelo que participou da linha, ou 'nenhum' quando nenhum participou"
+            - Name: run_id
+              Type: string
+              Comment: "identificador da execução da máquina de estados que produziu a linha"
+            - Name: source_hash
+              Type: string
+              Comment: "SHA-256 do HTML de origem; muda se a fonte republicar conteúdo diferente"
+            - Name: processed_at
+              Type: timestamp
+              Comment: "instante UTC em que a linha foi gravada"
+
+  SilverInferenceRawTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: silver_inference_raw
+        Description: "Saída do BERTimbau sobre o resíduo, com escore por span, ANTES da validação. Guardar o bruto é o que permite medir quantos spans a porta recusou."
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: date
+            Comment: "data da EDIÇÃO em que a publicação saiu — não a da assinatura. É a chave de partição e de reprocessamento"
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+          "projection.enabled": "true"
+          "projection.dt.type": "date"
+          "projection.dt.format": "yyyy-MM-dd"
+          "projection.dt.range": !Sub "${ProjectionStart},NOW"
+          "projection.dt.interval": "1"
+          "projection.dt.interval.unit": "DAYS"
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucketName}/silver/inference-raw/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: contract_id
+              Type: string
+              Comment: "o ato inferido"
+            - Name: entity_class
+              Type: string
+              Comment: "classe do span. Valores: CONTRATADA, CONTRATANTE"
+            - Name: span_text
+              Type: string
+              Comment: "o texto do span como o modelo o delimitou"
+            - Name: span_start
+              Type: int
+              Comment: "posição inicial do span em target_text"
+            - Name: span_end
+              Type: int
+              Comment: "posição final, exclusiva"
+            - Name: score
+              Type: double
+              Comment: "escore do span: o mínimo (não a média) das probabilidades das palavras que o compõem — o span só é aceito como certo se todas as suas palavras pertencem à entidade; entre 0 e 1, não é probabilidade calibrada"
+            - Name: accepted
+              Type: boolean
+              Comment: "o span passou pela porta de validação de nome — a mesma das camadas determinísticas"
+            - Name: rejection
+              Type: string
+              Comment: "a ressalva da porta, quando ela recusou"
+            - Name: truncated
+              Type: boolean
+              Comment: "target_text passou de 512 tokens e foi processado em janelas"
+            - Name: rule_version
+              Type: string
+              Comment: "versão do pacote domsp que produziu a linha; muda quando a regra muda"
+            - Name: model_version
+              Type: string
+              Comment: "versão do modelo que participou da linha, ou 'nenhum' quando nenhum participou"
+            - Name: run_id
+              Type: string
+              Comment: "identificador da execução da máquina de estados que produziu a linha"
+            - Name: source_hash
+              Type: string
+              Comment: "SHA-256 do HTML de origem; muda se a fonte republicar conteúdo diferente"
+            - Name: processed_at
+              Type: timestamp
+              Comment: "instante UTC em que a linha foi gravada"
+
+  SilverInferenceAcceptedTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: silver_inference_accepted
+        Description: "Os spans do modelo que passaram pela porta de validação de nome — a mesma porta das camadas determinísticas."
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: date
+            Comment: "data da EDIÇÃO em que a publicação saiu — não a da assinatura. É a chave de partição e de reprocessamento"
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+          "projection.enabled": "true"
+          "projection.dt.type": "date"
+          "projection.dt.format": "yyyy-MM-dd"
+          "projection.dt.range": !Sub "${ProjectionStart},NOW"
+          "projection.dt.interval": "1"
+          "projection.dt.interval.unit": "DAYS"
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucketName}/silver/inference-accepted/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: contract_id
+              Type: string
+              Comment: "o ato inferido"
+            - Name: entity_class
+              Type: string
+              Comment: "classe do span. Valores: CONTRATADA, CONTRATANTE"
+            - Name: span_text
+              Type: string
+              Comment: "o texto do span como o modelo o delimitou"
+            - Name: span_start
+              Type: int
+              Comment: "posição inicial do span em target_text"
+            - Name: span_end
+              Type: int
+              Comment: "posição final, exclusiva"
+            - Name: score
+              Type: double
+              Comment: "escore do span: o mínimo (não a média) das probabilidades das palavras que o compõem — o span só é aceito como certo se todas as suas palavras pertencem à entidade; entre 0 e 1, não é probabilidade calibrada"
+            - Name: accepted
+              Type: boolean
+              Comment: "o span passou pela porta de validação de nome — a mesma das camadas determinísticas"
+            - Name: rejection
+              Type: string
+              Comment: "a ressalva da porta, quando ela recusou"
+            - Name: truncated
+              Type: boolean
+              Comment: "target_text passou de 512 tokens e foi processado em janelas"
+            - Name: rule_version
+              Type: string
+              Comment: "versão do pacote domsp que produziu a linha; muda quando a regra muda"
+            - Name: model_version
+              Type: string
+              Comment: "versão do modelo que participou da linha, ou 'nenhum' quando nenhum participou"
+            - Name: run_id
+              Type: string
+              Comment: "identificador da execução da máquina de estados que produziu a linha"
+            - Name: source_hash
+              Type: string
+              Comment: "SHA-256 do HTML de origem; muda se a fonte republicar conteúdo diferente"
+            - Name: processed_at
+              Type: timestamp
+              Comment: "instante UTC em que a linha foi gravada"
+
+  SilverContractFinalTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: silver_contract_final
+        Description: "A prata consolidada: determinístico mais inferência aceita, reconciliados por precedência. É a única entrada do ouro."
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: date
+            Comment: "data da EDIÇÃO em que a publicação saiu — não a da assinatura. É a chave de partição e de reprocessamento"
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+          "projection.enabled": "true"
+          "projection.dt.type": "date"
+          "projection.dt.format": "yyyy-MM-dd"
+          "projection.dt.range": !Sub "${ProjectionStart},NOW"
+          "projection.dt.interval": "1"
+          "projection.dt.interval.unit": "DAYS"
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucketName}/silver/contract-final/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: contract_id
+              Type: string
+              Comment: "SHA-256 truncado da identidade canônica do ato; estável entre reexecuções"
+            - Name: publication_id
+              Type: string
+              Comment: "liga de volta a bronze_publication"
+            - Name: edition_date
+              Type: date
+              Comment: "data da edição, normalizada"
+            - Name: agency
+              Type: string
+              Comment: "órgão contratante"
+            - Name: act_kind
+              Type: string
+              Comment: "espécie do ato. Valores: contrato, aditivo, doacao, apostilamento, ata_registro_preco, penalidade, empenho, convenio, termo_colaboracao, termo_fomento, acordo_cooperacao, rescisao, autorizacao_uso"
+            - Name: financial_nature
+              Type: string
+              Comment: "natureza financeira do ato — o que decide se o valor pode somar. Valores: gasto_efetivo, reserva_preco, repasse, alteracao, nao_gasto"
+            - Name: is_annulment
+              Type: boolean
+              Comment: "o ato anula outro ato; um valor anulado nunca foi gasto"
+            - Name: is_republication
+              Type: boolean
+              Comment: "o ato republica outro; o art. 12, § 2º do decreto manda que revisão seja nova publicação, então republicação não é correção e sim linha nova"
+            - Name: contractor_name
+              Type: string
+              Comment: "parte contratada, validada pela porta única de nome"
+            - Name: contractor_tax_id
+              Type: string
+              Comment: "CNPJ ou CPF só com dígitos, com dígito verificador conferido pelo módulo 11"
+            - Name: object
+              Type: string
+              Comment: "objeto contratado como a fonte o escreveu, truncado em 2.000 caracteres; determinístico, nunca inferido por modelo"
+            - Name: contract_number
+              Type: string
+              Comment: "número do contrato ou do ajuste"
+            - Name: process_number
+              Type: string
+              Comment: "número do processo administrativo"
+            - Name: amount_brl
+              Type: decimal(18,2)
+              Comment: "valor em reais. NÃO somar sem o filtro de is_summable"
+            - Name: amount_magnitude
+              Type: string
+              Comment: "grandeza semântica do valor lido — total vence mensal e unitário na eleição. Valores: total, estimado, anual, mensal, unitario, parcela, penalidade, saldo, indefinido"
+            - Name: is_summable
+              Type: boolean
+              Comment: "o valor satisfaz a regra financeira: natureza gasto efetivo, grandeza total ou estimada, e ato não anulado. Aditivo e apostilamento têm natureza alteracao e não são somáveis"
+            - Name: summability_reason
+              Type: string
+              Comment: "por que o valor não pode somar, quando não pode. Valores: somavel, sem_valor, natureza_nao_somavel, grandeza_nao_somavel, anulado"
+            - Name: signature_date
+              Type: date
+              Comment: "data de assinatura; nula quando a fonte não declarou OU quando a data lida caiu fora da faixa de plausibilidade — a proveniência distingue os dois casos"
+            - Name: term_months
+              Type: int
+              Comment: "prazo normalizado em meses; dias convertidos pela regra declarada de 30"
+            - Name: legal_basis
+              Type: string
+              Comment: "artigo citado da Lei 14.133/2021, quando a fonte o declara"
+            - Name: field_provenance
+              Type: map<string,string>
+              Comment: "de que camada veio cada campo preenchido. Sem este mapa a cobertura por camada não é recalculável"
+            - Name: rule_version
+              Type: string
+              Comment: "versão do pacote domsp que produziu a linha; muda quando a regra muda"
+            - Name: model_version
+              Type: string
+              Comment: "versão do modelo que participou da linha, ou 'nenhum' quando nenhum participou"
+            - Name: run_id
+              Type: string
+              Comment: "identificador da execução da máquina de estados que produziu a linha"
+            - Name: source_hash
+              Type: string
+              Comment: "SHA-256 do HTML de origem; muda se a fonte republicar conteúdo diferente"
+            - Name: processed_at
+              Type: timestamp
+              Comment: "instante UTC em que a linha foi gravada"
+
+  GoldSupplierMonthTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: gold_supplier_month
+        Description: "Quanto cada fornecedor recebeu por mês, em quantos órgãos. Soma apenas valores que satisfazem a regra financeira — ver contrato.financeiro."
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucketName}/gold/supplier_month/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: year_month
+              Type: string
+              Comment: "mês da EDIÇÃO no formato aaaa-mm"
+            - Name: contractor_tax_id
+              Type: string
+              Comment: "agrupa por documento e não por nome: a fonte escreve a mesma empresa de várias formas e agrupar por nome a multiplicaria"
+            - Name: contractor_name
+              Type: string
+              Comment: "a grafia mais frequente do mesmo documento"
+            - Name: contract_count
+              Type: bigint
+              Comment: "quantos atos, somáveis ou não"
+            - Name: summable_count
+              Type: bigint
+              Comment: "quantos atos entraram no total"
+            - Name: total_amount_brl
+              Type: decimal(18,2)
+              Comment: "soma apenas dos valores que satisfazem a regra financeira"
+            - Name: agency_count
+              Type: bigint
+              Comment: "em quantos órgãos distintos"
+            - Name: rule_version
+              Type: string
+              Comment: "versão do pacote domsp que produziu a linha; muda quando a regra muda"
+            - Name: model_version
+              Type: string
+              Comment: "versão do modelo que participou da linha, ou 'nenhum' quando nenhum participou"
+            - Name: run_id
+              Type: string
+              Comment: "identificador da execução da máquina de estados que produziu a linha"
+            - Name: source_hash
+              Type: string
+              Comment: "SHA-256 do HTML de origem; muda se a fonte republicar conteúdo diferente"
+            - Name: processed_at
+              Type: timestamp
+              Comment: "instante UTC em que a linha foi gravada"
+
+  GoldAgencyMonthTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: gold_agency_month
+        Description: "Quanto cada órgão contratou por mês, de quantos fornecedores. Mesma regra financeira."
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucketName}/gold/agency_month/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: year_month
+              Type: string
+              Comment: "mês da edição no formato aaaa-mm"
+            - Name: agency
+              Type: string
+              Comment: "órgão contratante"
+            - Name: contract_count
+              Type: bigint
+              Comment: "quantos atos"
+            - Name: summable_count
+              Type: bigint
+              Comment: "quantos entraram no total"
+            - Name: total_amount_brl
+              Type: decimal(18,2)
+              Comment: "soma sob a regra financeira"
+            - Name: supplier_count
+              Type: bigint
+              Comment: "de quantos fornecedores distintos"
+            - Name: rule_version
+              Type: string
+              Comment: "versão do pacote domsp que produziu a linha; muda quando a regra muda"
+            - Name: model_version
+              Type: string
+              Comment: "versão do modelo que participou da linha, ou 'nenhum' quando nenhum participou"
+            - Name: run_id
+              Type: string
+              Comment: "identificador da execução da máquina de estados que produziu a linha"
+            - Name: source_hash
+              Type: string
+              Comment: "SHA-256 do HTML de origem; muda se a fonte republicar conteúdo diferente"
+            - Name: processed_at
+              Type: timestamp
+              Comment: "instante UTC em que a linha foi gravada"
+
+  GoldQualityTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: gold_quality
+        Description: "As métricas do próprio pipeline, por execução: cobertura por camada e por campo, com intervalo de Wilson. É o que torna a degradação visível sem ninguém ir olhar."
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          "parquet.compression": SNAPPY
+        StorageDescriptor:
+          Location: !Sub "s3://${DataLakeBucketName}/gold/quality/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: metric_name
+              Type: string
+              Comment: "o que foi medido"
+            - Name: stratum
+              Type: string
+              Comment: "o estrato em que foi medido; 'agregado' é o corpus todo. Valores: agregado, com_rotulo, sem_rotulo, residuo"
+            - Name: numerator
+              Type: bigint
+              Comment: "quantos satisfizeram"
+            - Name: denominator
+              Type: bigint
+              Comment: "de quantos"
+            - Name: proportion
+              Type: double
+              Comment: "numerador sobre denominador"
+            - Name: ci_lower
+              Type: double
+              Comment: "limite inferior do intervalo de 95%"
+            - Name: ci_upper
+              Type: double
+              Comment: "limite superior"
+            - Name: ci_method
+              Type: string
+              Comment: "método do intervalo; Wilson e não normal, porque com proporção perto de 0 ou 1 o normal produz limite fora de [0,1]. Valores: wilson, bootstrap, katz"
+            - Name: measured_at
+              Type: timestamp
+              Comment: "instante UTC da medição"
+            - Name: rule_version
+              Type: string
+              Comment: "versão do pacote domsp que produziu a linha; muda quando a regra muda"
+            - Name: model_version
+              Type: string
+              Comment: "versão do modelo que participou da linha, ou 'nenhum' quando nenhum participou"
+            - Name: run_id
+              Type: string
+              Comment: "identificador da execução da máquina de estados que produziu a linha"
+            - Name: source_hash
+              Type: string
+              Comment: "SHA-256 do HTML de origem; muda se a fonte republicar conteúdo diferente"
+            - Name: processed_at
+              Type: timestamp
+              Comment: "instante UTC em que a linha foi gravada"
+

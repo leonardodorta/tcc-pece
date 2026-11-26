@@ -1,0 +1,67 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "DOM-SP pipeline - conditional SageMaker Model, created only when an artifact exists"
+
+# ---------------------------------------------------------------------------
+# Cria o AWS::SageMaker::Model, de forma condicional: so quando ModelArtifactUri e informado.
+# Com o parametro vazio (padrao), nada neste template e criado e a pilha e um no-op valido,
+# permitindo implantar a infraestrutura antes de existir modelo treinado.
+#
+# Batch Transform roda em CPU: o container usa o `inference.py` do proprio model.tar.gz.
+#
+# As Description deste template sao ASCII por convencao.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  Environment:
+    Type: String
+  ModelArtifactUri:
+    Type: String
+    Default: ""
+    Description: "S3 URI of model.tar.gz. Empty means no model yet - nothing is created"
+  InferenceImageUri:
+    Type: String
+    Description: "ECR URI of the inference container. Required only when ModelArtifactUri is set"
+  SageMakerRoleArn:
+    Type: String
+  ModelServerWorkers:
+    Type: String
+    Default: "4"
+    Description: "Model server workers. Each one loads a full copy of the model in memory"
+  ThreadsPerWorker:
+    Type: String
+    Default: "2"
+    Description: "Torch threads per worker. workers x threads should not exceed the instance vCPU"
+
+Conditions:
+  # So cria o modelo quando ha artefato.
+  HasModel: !Not [!Equals [!Ref ModelArtifactUri, ""]]
+
+Resources:
+
+  ContractExtractionModel:
+    Type: AWS::SageMaker::Model
+    Condition: HasModel
+    Properties:
+      ModelName: !Sub "domsp-${Environment}-ner"
+      ExecutionRoleArn: !Ref SageMakerRoleArn
+      PrimaryContainer:
+        Image: !Ref InferenceImageUri
+        ModelDataUrl: !Ref ModelArtifactUri
+        Environment:
+          # O container do SageMaker acha `code/inference.py` na raiz do tar por estas duas
+          # variaveis. Sem elas, roda o handler padrao, que nao conhece o formato esperado.
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/model/code
+          # Cada worker carrega uma copia inteira do modelo em memoria: workers x threads nao
+          # deve exceder o vCPU da instancia, e a concorrencia do Batch Transform e igual ao
+          # numero de workers.
+          SAGEMAKER_MODEL_SERVER_WORKERS: !Ref ModelServerWorkers
+          OMP_NUM_THREADS: !Ref ThreadsPerWorker
+
+Outputs:
+  ModelName:
+    Description: "Name of the SageMaker model, or the string none when no artifact was given"
+    Value: !If [HasModel, !GetAtt ContractExtractionModel.ModelName, "none"]
+  HasModel:
+    Description: "Whether a model resource was created in this stack"
+    Value: !If [HasModel, "true", "false"]

@@ -1,0 +1,1121 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "DOM-SP pipeline - QuickSight dashboard over the gold layer"
+
+# ---------------------------------------------------------------------------
+# Painel QuickSight sobre a camada ouro: cria a fonte de dados Athena, os conjuntos de dados
+# e a analise/dashboard com seis visuais em tres folhas (financeiro, contradicoes de
+# cobertura, perfil por orgao). Pressupoe uma subscricao do QuickSight ja existente na conta.
+#
+# `ImportMode: SPICE` em vez de consulta direta: o ouro e pequeno o bastante para o SPICE, e
+# as consultas dos visuais deixam de ir ao Athena. O Athena ainda e consultado a cada refresh
+# do SPICE, e o painel mostra o estado do ultimo refresh.
+#
+# `QuickSightPrincipalArn` nao tem valor padrao: o ARN varia por conta e por forma de login.
+#
+# As Description deste template sao ASCII por convencao.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+  DatabaseName:
+    Type: String
+    Description: "Glue database holding the gold tables"
+
+  AthenaWorkGroupName:
+    Type: String
+    Description: "Athena WorkGroup the data source queries through"
+
+  QuickSightPrincipalArn:
+    Type: String
+    Description: "QuickSight user ARN that owns the dashboard - no sensible default exists"
+
+Resources:
+
+  # Fonte de dados: Athena, usando o WorkGroup do projeto (nao o `primary`), que ja tem o
+  # local de resultado configurado e a politica de ciclo de vida.
+  GoldDataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub "domsp-${Environment}-gold-athena"
+      Name: !Sub "DOM-SP ${Environment} - ouro (Athena)"
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Ref AthenaWorkGroupName
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - "quicksight:DescribeDataSource"
+            - "quicksight:DescribeDataSourcePermissions"
+            - "quicksight:PassDataSource"
+            - "quicksight:UpdateDataSource"
+            - "quicksight:DeleteDataSource"
+            - "quicksight:UpdateDataSourcePermissions"
+      SslProperties:
+        DisableSsl: false
+
+  # Conjunto de dados: fornecedor por mes.
+  SupplierMonthDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "domsp-${Environment}-supplier-month"
+      Name: !Sub "DOM-SP ${Environment} - fornecedor por mes"
+      ImportMode: SPICE
+      PhysicalTableMap:
+        SupplierMonthTable:
+          RelationalTable:
+            DataSourceArn: !GetAtt GoldDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref DatabaseName
+            Name: gold_supplier_month
+            InputColumns:
+              - { Name: year_month, Type: STRING }
+              - { Name: contractor_tax_id, Type: STRING }
+              - { Name: contractor_name, Type: STRING }
+              - { Name: contract_count, Type: INTEGER }
+              - { Name: summable_count, Type: INTEGER }
+              - { Name: total_amount_brl, Type: DECIMAL }
+              - { Name: agency_count, Type: INTEGER }
+      LogicalTableMap:
+        SupplierMonthLogical:
+          Alias: fornecedor_mes
+          Source:
+            PhysicalTableId: SupplierMonthTable
+          DataTransforms:
+            # Coluna derivada aqui (nao no Spark): e uma subtracao entre duas colunas que a
+            # tabela gold_supplier_month ja publica.
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: atos_nao_somaveis
+                    ColumnId: atos_nao_somaveis
+                    Expression: "{contract_count} - {summable_count}"
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - "quicksight:DescribeDataSet"
+            - "quicksight:DescribeDataSetPermissions"
+            - "quicksight:PassDataSet"
+            - "quicksight:DescribeIngestion"
+            - "quicksight:ListIngestions"
+            - "quicksight:UpdateDataSet"
+            - "quicksight:DeleteDataSet"
+            - "quicksight:CreateIngestion"
+            - "quicksight:CancelIngestion"
+            - "quicksight:UpdateDataSetPermissions"
+
+  # Conjunto de dados: orgao por mes.
+  AgencyMonthDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "domsp-${Environment}-agency-month"
+      Name: !Sub "DOM-SP ${Environment} - orgao por mes"
+      ImportMode: SPICE
+      PhysicalTableMap:
+        AgencyMonthTable:
+          RelationalTable:
+            DataSourceArn: !GetAtt GoldDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref DatabaseName
+            Name: gold_agency_month
+            InputColumns:
+              - { Name: year_month, Type: STRING }
+              - { Name: agency, Type: STRING }
+              - { Name: contract_count, Type: INTEGER }
+              - { Name: summable_count, Type: INTEGER }
+              - { Name: total_amount_brl, Type: DECIMAL }
+              - { Name: supplier_count, Type: INTEGER }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - "quicksight:DescribeDataSet"
+            - "quicksight:DescribeDataSetPermissions"
+            - "quicksight:PassDataSet"
+            - "quicksight:DescribeIngestion"
+            - "quicksight:ListIngestions"
+            - "quicksight:UpdateDataSet"
+            - "quicksight:DeleteDataSet"
+            - "quicksight:CreateIngestion"
+            - "quicksight:CancelIngestion"
+            - "quicksight:UpdateDataSetPermissions"
+
+  # Conjuntos de qualidade: dois conjuntos sobre a MESMA tabela gold_quality, cada um
+  # filtrado na origem (FilterOperation) por um subconjunto de metric_name.
+  #
+  # Filtrar na ingestao, e nao no visual: com `SelectAllOptions: FILTER_ALL_VALUES` o filtro
+  # do visual fica inoperante, e como as metricas de gold_quality misturam grandezas de
+  # naturezas diferentes (camadas de extracao, totais, motivos de exclusao), a soma delas
+  # excede 100% e o grafico de pizza exibiria o excedente como "null". Filtrando na
+  # ingestao, o que nao e camada nao entra no conjunto.
+  QualityLayersDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "domsp-${Environment}-quality-layers"
+      Name: !Sub "DOM-SP ${Environment} - cobertura por camada"
+      ImportMode: SPICE
+      PhysicalTableMap:
+        QualityTable:
+          RelationalTable:
+            DataSourceArn: !GetAtt GoldDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref DatabaseName
+            Name: gold_quality
+            InputColumns:
+              - { Name: metric_name, Type: STRING }
+              - { Name: numerator, Type: INTEGER }
+              - { Name: denominator, Type: INTEGER }
+              - { Name: proportion, Type: DECIMAL }
+      LogicalTableMap:
+        QualityLayersLogical:
+          Alias: camadas
+          Source:
+            PhysicalTableId: QualityTable
+          DataTransforms:
+            # Lista explicita, excluindo `layer_deterministic_total` de proposito: ele e a
+            # soma das tres primeiras camadas, e incluido somaria as partes com o total.
+            - FilterOperation:
+                ConditionExpression: >-
+                  in({metric_name}, ['layer_form','layer_prose_label','layer_tax_id_anchor','layer_model'])
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: camada
+                    ColumnId: camada
+                    Expression: >-
+                      ifelse(
+                        {metric_name} = 'layer_form', '1 - Campo do formulario',
+                        {metric_name} = 'layer_prose_label', '2 - Rotulo na prosa',
+                        {metric_name} = 'layer_tax_id_anchor', '3 - Ancora por CNPJ',
+                        '4 - Modelo (BERTimbau aprovado)'
+                      )
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: pct
+                    ColumnId: pct
+                    Expression: "{proportion} * 100"
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - "quicksight:DescribeDataSet"
+            - "quicksight:DescribeDataSetPermissions"
+            - "quicksight:PassDataSet"
+            - "quicksight:DescribeIngestion"
+            - "quicksight:ListIngestions"
+            - "quicksight:UpdateDataSet"
+            - "quicksight:DeleteDataSet"
+            - "quicksight:CreateIngestion"
+            - "quicksight:CancelIngestion"
+            - "quicksight:UpdateDataSetPermissions"
+
+  QualityReasonsDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "domsp-${Environment}-quality-reasons"
+      Name: !Sub "DOM-SP ${Environment} - razoes de nao somar"
+      ImportMode: SPICE
+      PhysicalTableMap:
+        QualityTable:
+          RelationalTable:
+            DataSourceArn: !GetAtt GoldDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref DatabaseName
+            Name: gold_quality
+            InputColumns:
+              - { Name: metric_name, Type: STRING }
+              - { Name: numerator, Type: INTEGER }
+              - { Name: denominator, Type: INTEGER }
+              - { Name: proportion, Type: DECIMAL }
+      LogicalTableMap:
+        QualityReasonsLogical:
+          Alias: razoes
+          Source:
+            PhysicalTableId: QualityTable
+          DataTransforms:
+            - FilterOperation:
+                ConditionExpression: >-
+                  in({metric_name}, ['not_summable_sem_valor','not_summable_natureza_nao_somavel','not_summable_grandeza_nao_somavel','not_summable_anulado'])
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: razao
+                    ColumnId: razao
+                    Expression: >-
+                      ifelse(
+                        {metric_name} = 'not_summable_sem_valor', 'Sem valor declarado',
+                        {metric_name} = 'not_summable_natureza_nao_somavel', 'Natureza nao somavel (repasse, ata, multa)',
+                        {metric_name} = 'not_summable_grandeza_nao_somavel', 'Grandeza nao somavel (mensal, unitario)',
+                        'Ato anulado'
+                      )
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: pct
+                    ColumnId: pct
+                    Expression: "{proportion} * 100"
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - "quicksight:DescribeDataSet"
+            - "quicksight:DescribeDataSetPermissions"
+            - "quicksight:PassDataSet"
+            - "quicksight:DescribeIngestion"
+            - "quicksight:ListIngestions"
+            - "quicksight:UpdateDataSet"
+            - "quicksight:DeleteDataSet"
+            - "quicksight:CreateIngestion"
+            - "quicksight:CancelIngestion"
+            - "quicksight:UpdateDataSetPermissions"
+
+  # Analise: seis visuais em tres folhas (financeiro, contradicoes, perfil por orgao).
+  GoldAnalysis:
+    Type: AWS::QuickSight::Analysis
+    # Sem DependsOn: os `!GetAtt ...Arn` em DataSetIdentifierDeclarations ja estabelecem a
+    # ordem (o cfn-lint avisa, W3005, se declarado tambem).
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      AnalysisId: !Sub "domsp-${Environment}-gold-analysis"
+      Name: !Sub "DOM-SP ${Environment} - contratacoes do Diario Oficial"
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - "quicksight:RestoreAnalysis"
+            - "quicksight:UpdateAnalysisPermissions"
+            - "quicksight:DeleteAnalysis"
+            - "quicksight:DescribeAnalysisPermissions"
+            - "quicksight:QueryAnalysis"
+            - "quicksight:DescribeAnalysis"
+            - "quicksight:UpdateAnalysis"
+      Definition:
+        DataSetIdentifierDeclarations:
+          - Identifier: fornecedor_mes
+            DataSetArn: !GetAtt SupplierMonthDataSet.Arn
+          - Identifier: orgao_mes
+            DataSetArn: !GetAtt AgencyMonthDataSet.Arn
+          - Identifier: camadas
+            DataSetArn: !GetAtt QualityLayersDataSet.Arn
+          - Identifier: razoes
+            DataSetArn: !GetAtt QualityReasonsDataSet.Arn
+
+        Sheets:
+          # Folha 1 — a situacao financeira.
+          - SheetId: financeiro
+            Name: "Situacao financeira"
+            Visuals:
+
+              # Visual 1: serie mensal do gasto somavel. Linha, nao barra, pois a pergunta e
+              # de tendencia.
+              - LineChartVisual:
+                  VisualId: gasto-mensal
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "1. Gasto somavel por mes (R$) - so o que a regra financeira (is_summable) admite somar"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Exclui valor mensal, unitario, multa, ata de registro, repasse e ato anulado"
+                  ChartConfiguration:
+                    FieldWells:
+                      LineChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: mes
+                              Column:
+                                DataSetIdentifier: fornecedor_mes
+                                ColumnName: year_month
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: total
+                              Column:
+                                DataSetIdentifier: fornecedor_mes
+                                ColumnName: total_amount_brl
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              # Formatacao no CAMPO, nao no rotulo: afeta eixo, tooltip e
+                              # rotulo ao mesmo tempo.
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  NumberDisplayFormatConfiguration:
+                                    Prefix: "R$ "
+                                    NumberScale: BILLIONS
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 2
+                    SortConfiguration:
+                      # LineChart usa `CategoryItemsLimitConfiguration`; BarChart usa
+                      # `CategoryItemsLimit` - os nomes divergem entre visuais no esquema do
+                      # QuickSight.
+                      CategoryItemsLimitConfiguration:
+                        ItemsLimit: 24
+                        OtherCategories: EXCLUDE
+                    DataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+                      Position: TOP
+                    VisualPalette:
+                      ChartColor: "#2E86AB"
+                  ColumnHierarchies: []
+              - BarChartVisual:
+                  VisualId: top-fornecedores
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "2. Maiores fornecedores por valor somavel (R$)"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Agrupado por CNPJ, nao por nome - a mesma empresa aparece com grafias diferentes na fonte"
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: fornecedor
+                              Column:
+                                DataSetIdentifier: fornecedor_mes
+                                ColumnName: contractor_name
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: valor_fornecedor
+                              Column:
+                                DataSetIdentifier: fornecedor_mes
+                                ColumnName: total_amount_brl
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  NumberDisplayFormatConfiguration:
+                                    Prefix: "R$ "
+                                    NumberScale: MILLIONS
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 1
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: valor_fornecedor
+                            Direction: DESC
+                      CategoryItemsLimit:
+                        ItemsLimit: 15
+                        OtherCategories: EXCLUDE
+                    DataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+                      Position: OUTSIDE
+                    VisualPalette:
+                      ChartColor: "#2E86AB"
+
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                    - ElementId: gasto-mensal
+                      ElementType: VISUAL
+                      ColumnIndex: 0
+                      ColumnSpan: 36
+                      RowIndex: 0
+                      RowSpan: 14
+                    - ElementId: top-fornecedores
+                      ElementType: VISUAL
+                      ColumnIndex: 0
+                      ColumnSpan: 36
+                      RowIndex: 14
+                      RowSpan: 16
+            SheetControlLayouts: []
+
+          # Folha 2 — contradicoes e cobertura: o que a fonte publica e o que dela se pode
+          # somar sao quantidades diferentes (parte dos atos nao entra num somatorio).
+          - SheetId: contradicoes
+            Name: "Contradicoes e cobertura"
+            Visuals:
+
+              # Visual 3: por que parte dos atos nao soma.
+              - BarChartVisual:
+                  VisualId: razoes-nao-somar
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "3. Por que parte dos atos NAO entra no somatorio de gasto (% dos atos)"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Somar amount_brl sem aplicar a regra financeira superestima o gasto: a barra mostra a proporcao de atos excluida por motivo"
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: razao
+                              Column:
+                                DataSetIdentifier: razoes
+                                ColumnName: razao
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: pct_razao
+                              Column:
+                                DataSetIdentifier: razoes
+                                ColumnName: pct
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  PercentageDisplayFormatConfiguration:
+                                    Suffix: "%"
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 1
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: pct_razao
+                            Direction: DESC
+                    DataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+                      Position: OUTSIDE
+                    VisualPalette:
+                      ChartColor: "#D64550"
+                  Actions: []
+                  ColumnHierarchies: []
+
+              # Visual 4: de onde vem cada nome de fornecedor - camadas 1-3 sao
+              # deterministicas, a 4 e a extracao por modelo.
+              - PieChartVisual:
+                  VisualId: camadas
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "4. De onde vem o nome do fornecedor (% dos atos)"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Camadas 1-3 sao deterministicas. A camada 4 e a extracao por modelo, aplicada aos atos que as camadas anteriores nao resolveram"
+                  ChartConfiguration:
+                    DonutOptions:
+                      ArcOptions:
+                        ArcThickness: MEDIUM
+                    FieldWells:
+                      PieChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: camada
+                              Column:
+                                DataSetIdentifier: camadas
+                                ColumnName: camada
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: pct_camada
+                              Column:
+                                DataSetIdentifier: camadas
+                                ColumnName: pct
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  PercentageDisplayFormatConfiguration:
+                                    Suffix: "%"
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 1
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: pct_camada
+                            Direction: DESC
+                    DataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: PERCENT
+                      Position: INSIDE
+
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                    - ElementId: razoes-nao-somar
+                      ElementType: VISUAL
+                      ColumnIndex: 0
+                      ColumnSpan: 20
+                      RowIndex: 0
+                      RowSpan: 16
+                    - ElementId: camadas
+                      ElementType: VISUAL
+                      ColumnIndex: 20
+                      ColumnSpan: 16
+                      RowIndex: 0
+                      RowSpan: 16
+            SheetControlLayouts: []
+
+          # Folha 3 — perfil por orgao: a mesma pergunta de gasto, pelo lado do contratante.
+          - SheetId: orgaos
+            Name: "Perfil por orgao"
+            Visuals:
+
+              # Visual 5: orgaos que mais contratam. Barra horizontal, nome de orgao e longo.
+              - BarChartVisual:
+                  VisualId: top-orgaos
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "5. Orgaos que mais contrataram, por valor somavel (R$)"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Mesma regra financeira (is_summable) - so valor de gasto efetivo, total ou estimado, nao anulado"
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: orgao
+                              Column:
+                                DataSetIdentifier: orgao_mes
+                                ColumnName: agency
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: valor_orgao
+                              Column:
+                                DataSetIdentifier: orgao_mes
+                                ColumnName: total_amount_brl
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  NumberDisplayFormatConfiguration:
+                                    Prefix: "R$ "
+                                    NumberScale: MILLIONS
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 1
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: valor_orgao
+                            Direction: DESC
+                      CategoryItemsLimit:
+                        ItemsLimit: 15
+                        OtherCategories: EXCLUDE
+                    DataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+                      Position: OUTSIDE
+                    VisualPalette:
+                      ChartColor: "#2E8B57"
+
+              # Visual 6: gasto x numero de fornecedores por orgao - combo de barra e linha
+              # para comparar as duas medidas no mesmo eixo de categoria.
+              - ComboChartVisual:
+                  VisualId: diversificacao-fornecedores
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "6. Gasto somavel x numero de fornecedores distintos, por orgao"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Um orgao com gasto alto e poucos fornecedores concentra risco de dependencia; o grafico nao conclui isso, so expoe o numero"
+                  ChartConfiguration:
+                    BarsArrangement: CLUSTERED
+                    FieldWells:
+                      ComboChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: orgao_combo
+                              Column:
+                                DataSetIdentifier: orgao_mes
+                                ColumnName: agency
+                        BarValues:
+                          - NumericalMeasureField:
+                              FieldId: valor_orgao_combo
+                              Column:
+                                DataSetIdentifier: orgao_mes
+                                ColumnName: total_amount_brl
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  NumberDisplayFormatConfiguration:
+                                    Prefix: "R$ "
+                                    NumberScale: MILLIONS
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 1
+                        LineValues:
+                          - NumericalMeasureField:
+                              FieldId: fornecedores_orgao
+                              Column:
+                                DataSetIdentifier: orgao_mes
+                                ColumnName: supplier_count
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: valor_orgao_combo
+                            Direction: DESC
+                      CategoryItemsLimit:
+                        ItemsLimit: 15
+                        OtherCategories: EXCLUDE
+                    BarDataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+                      Position: OUTSIDE
+                    LineDataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                    - ElementId: top-orgaos
+                      ElementType: VISUAL
+                      ColumnIndex: 0
+                      ColumnSpan: 36
+                      RowIndex: 0
+                      RowSpan: 14
+                    - ElementId: diversificacao-fornecedores
+                      ElementType: VISUAL
+                      ColumnIndex: 0
+                      ColumnSpan: 36
+                      RowIndex: 14
+                      RowSpan: 16
+            SheetControlLayouts: []
+
+  # O painel publicado, separado da analise: a analise e o ambiente de edicao, o painel e o
+  # artefato que se compartilha.
+  GoldDashboard:
+    Type: AWS::QuickSight::Dashboard
+    DependsOn: GoldAnalysis
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DashboardId: !Sub "domsp-${Environment}-gold-dashboard"
+      Name: !Sub "DOM-SP ${Environment} - contratacoes publicas do Diario Oficial"
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - "quicksight:DescribeDashboard"
+            - "quicksight:ListDashboardVersions"
+            - "quicksight:UpdateDashboardPermissions"
+            - "quicksight:QueryDashboard"
+            - "quicksight:UpdateDashboard"
+            - "quicksight:DeleteDashboard"
+            - "quicksight:DescribeDashboardPermissions"
+            - "quicksight:UpdateDashboardPublishedVersion"
+      # A DEFINICAO E REPETIDA, nao referenciada da analise: `SourceEntity.SourceTemplate`
+      # exige um `AWS::QuickSight::Template`, nao uma analise, e o CloudFormation nao expoe a
+      # definicao da analise como atributo. A duplicacao e imposta pelo servico; este bloco e
+      # a versao publicada, o de GoldAnalysis e a versao de edicao - os dois devem ser
+      # mantidos sincronizados manualmente.
+      Definition:
+        DataSetIdentifierDeclarations:
+          - Identifier: fornecedor_mes
+            DataSetArn: !GetAtt SupplierMonthDataSet.Arn
+          - Identifier: orgao_mes
+            DataSetArn: !GetAtt AgencyMonthDataSet.Arn
+          - Identifier: camadas
+            DataSetArn: !GetAtt QualityLayersDataSet.Arn
+          - Identifier: razoes
+            DataSetArn: !GetAtt QualityReasonsDataSet.Arn
+        Sheets:
+          # Folha 1 — a situacao financeira.
+          - SheetId: financeiro
+            Name: "Situacao financeira"
+            Visuals:
+
+              # Visual 1: serie mensal do gasto somavel. Linha, nao barra, pois a pergunta e
+              # de tendencia.
+              - LineChartVisual:
+                  VisualId: gasto-mensal
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "1. Gasto somavel por mes (R$) - so o que a regra financeira (is_summable) admite somar"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Exclui valor mensal, unitario, multa, ata de registro, repasse e ato anulado"
+                  ChartConfiguration:
+                    FieldWells:
+                      LineChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: mes
+                              Column:
+                                DataSetIdentifier: fornecedor_mes
+                                ColumnName: year_month
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: total
+                              Column:
+                                DataSetIdentifier: fornecedor_mes
+                                ColumnName: total_amount_brl
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              # Formatacao no CAMPO, nao no rotulo: afeta eixo, tooltip e
+                              # rotulo ao mesmo tempo.
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  NumberDisplayFormatConfiguration:
+                                    Prefix: "R$ "
+                                    NumberScale: BILLIONS
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 2
+                    SortConfiguration:
+                      # LineChart usa `CategoryItemsLimitConfiguration`; BarChart usa
+                      # `CategoryItemsLimit` - os nomes divergem entre visuais no esquema do
+                      # QuickSight.
+                      CategoryItemsLimitConfiguration:
+                        ItemsLimit: 24
+                        OtherCategories: EXCLUDE
+                    DataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+                      Position: TOP
+                    VisualPalette:
+                      ChartColor: "#2E86AB"
+                  ColumnHierarchies: []
+              - BarChartVisual:
+                  VisualId: top-fornecedores
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "2. Maiores fornecedores por valor somavel (R$)"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Agrupado por CNPJ, nao por nome - a mesma empresa aparece com grafias diferentes na fonte"
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: fornecedor
+                              Column:
+                                DataSetIdentifier: fornecedor_mes
+                                ColumnName: contractor_name
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: valor_fornecedor
+                              Column:
+                                DataSetIdentifier: fornecedor_mes
+                                ColumnName: total_amount_brl
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  NumberDisplayFormatConfiguration:
+                                    Prefix: "R$ "
+                                    NumberScale: MILLIONS
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 1
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: valor_fornecedor
+                            Direction: DESC
+                      CategoryItemsLimit:
+                        ItemsLimit: 15
+                        OtherCategories: EXCLUDE
+                    DataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+                      Position: OUTSIDE
+                    VisualPalette:
+                      ChartColor: "#2E86AB"
+
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                    - ElementId: gasto-mensal
+                      ElementType: VISUAL
+                      ColumnIndex: 0
+                      ColumnSpan: 36
+                      RowIndex: 0
+                      RowSpan: 14
+                    - ElementId: top-fornecedores
+                      ElementType: VISUAL
+                      ColumnIndex: 0
+                      ColumnSpan: 36
+                      RowIndex: 14
+                      RowSpan: 16
+            SheetControlLayouts: []
+
+          # Folha 2 — contradicoes e cobertura: o que a fonte publica e o que dela se pode
+          # somar sao quantidades diferentes (parte dos atos nao entra num somatorio).
+          - SheetId: contradicoes
+            Name: "Contradicoes e cobertura"
+            Visuals:
+
+              # Visual 3: por que parte dos atos nao soma.
+              - BarChartVisual:
+                  VisualId: razoes-nao-somar
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "3. Por que parte dos atos NAO entra no somatorio de gasto (% dos atos)"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Somar amount_brl sem aplicar a regra financeira superestima o gasto: a barra mostra a proporcao de atos excluida por motivo"
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: razao
+                              Column:
+                                DataSetIdentifier: razoes
+                                ColumnName: razao
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: pct_razao
+                              Column:
+                                DataSetIdentifier: razoes
+                                ColumnName: pct
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  PercentageDisplayFormatConfiguration:
+                                    Suffix: "%"
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 1
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: pct_razao
+                            Direction: DESC
+                    DataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+                      Position: OUTSIDE
+                    VisualPalette:
+                      ChartColor: "#D64550"
+                  Actions: []
+                  ColumnHierarchies: []
+
+              # Visual 4: de onde vem cada nome de fornecedor - camadas 1-3 sao
+              # deterministicas, a 4 e a extracao por modelo.
+              - PieChartVisual:
+                  VisualId: camadas
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "4. De onde vem o nome do fornecedor (% dos atos)"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Camadas 1-3 sao deterministicas. A camada 4 e a extracao por modelo, aplicada aos atos que as camadas anteriores nao resolveram"
+                  ChartConfiguration:
+                    DonutOptions:
+                      ArcOptions:
+                        ArcThickness: MEDIUM
+                    FieldWells:
+                      PieChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: camada
+                              Column:
+                                DataSetIdentifier: camadas
+                                ColumnName: camada
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: pct_camada
+                              Column:
+                                DataSetIdentifier: camadas
+                                ColumnName: pct
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  PercentageDisplayFormatConfiguration:
+                                    Suffix: "%"
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 1
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: pct_camada
+                            Direction: DESC
+                    DataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: PERCENT
+                      Position: INSIDE
+
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                    - ElementId: razoes-nao-somar
+                      ElementType: VISUAL
+                      ColumnIndex: 0
+                      ColumnSpan: 20
+                      RowIndex: 0
+                      RowSpan: 16
+                    - ElementId: camadas
+                      ElementType: VISUAL
+                      ColumnIndex: 20
+                      ColumnSpan: 16
+                      RowIndex: 0
+                      RowSpan: 16
+            SheetControlLayouts: []
+
+          # Folha 3 — perfil por orgao: a mesma pergunta de gasto, pelo lado do contratante.
+          - SheetId: orgaos
+            Name: "Perfil por orgao"
+            Visuals:
+
+              # Visual 5: orgaos que mais contratam. Barra horizontal, nome de orgao e longo.
+              - BarChartVisual:
+                  VisualId: top-orgaos
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "5. Orgaos que mais contrataram, por valor somavel (R$)"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Mesma regra financeira (is_summable) - so valor de gasto efetivo, total ou estimado, nao anulado"
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: orgao
+                              Column:
+                                DataSetIdentifier: orgao_mes
+                                ColumnName: agency
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: valor_orgao
+                              Column:
+                                DataSetIdentifier: orgao_mes
+                                ColumnName: total_amount_brl
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  NumberDisplayFormatConfiguration:
+                                    Prefix: "R$ "
+                                    NumberScale: MILLIONS
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 1
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: valor_orgao
+                            Direction: DESC
+                      CategoryItemsLimit:
+                        ItemsLimit: 15
+                        OtherCategories: EXCLUDE
+                    DataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+                      Position: OUTSIDE
+                    VisualPalette:
+                      ChartColor: "#2E8B57"
+
+              # Visual 6: gasto x numero de fornecedores por orgao - combo de barra e linha
+              # para comparar as duas medidas no mesmo eixo de categoria.
+              - ComboChartVisual:
+                  VisualId: diversificacao-fornecedores
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "6. Gasto somavel x numero de fornecedores distintos, por orgao"
+                  Subtitle:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: "Um orgao com gasto alto e poucos fornecedores concentra risco de dependencia; o grafico nao conclui isso, so expoe o numero"
+                  ChartConfiguration:
+                    BarsArrangement: CLUSTERED
+                    FieldWells:
+                      ComboChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: orgao_combo
+                              Column:
+                                DataSetIdentifier: orgao_mes
+                                ColumnName: agency
+                        BarValues:
+                          - NumericalMeasureField:
+                              FieldId: valor_orgao_combo
+                              Column:
+                                DataSetIdentifier: orgao_mes
+                                ColumnName: total_amount_brl
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                              FormatConfiguration:
+                                FormatConfiguration:
+                                  NumberDisplayFormatConfiguration:
+                                    Prefix: "R$ "
+                                    NumberScale: MILLIONS
+                                    DecimalPlacesConfiguration:
+                                      DecimalPlaces: 1
+                        LineValues:
+                          - NumericalMeasureField:
+                              FieldId: fornecedores_orgao
+                              Column:
+                                DataSetIdentifier: orgao_mes
+                                ColumnName: supplier_count
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: valor_orgao_combo
+                            Direction: DESC
+                      CategoryItemsLimit:
+                        ItemsLimit: 15
+                        OtherCategories: EXCLUDE
+                    BarDataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+                      Position: OUTSIDE
+                    LineDataLabels:
+                      Visibility: VISIBLE
+                      LabelContent: VALUE
+
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                    - ElementId: top-orgaos
+                      ElementType: VISUAL
+                      ColumnIndex: 0
+                      ColumnSpan: 36
+                      RowIndex: 0
+                      RowSpan: 14
+                    - ElementId: diversificacao-fornecedores
+                      ElementType: VISUAL
+                      ColumnIndex: 0
+                      ColumnSpan: 36
+                      RowIndex: 14
+                      RowSpan: 16
+            SheetControlLayouts: []
+
+      DashboardPublishOptions:
+        AdHocFilteringOption:
+          AvailabilityStatus: DISABLED
+        ExportToCSVOption:
+          AvailabilityStatus: ENABLED
+        SheetControlsOption:
+          VisibilityState: EXPANDED
+
+Outputs:
+  DataSourceArn:
+    Description: "Athena data source feeding the gold datasets"
+    Value: !GetAtt GoldDataSource.Arn
+
+  AnalysisId:
+    Description: "QuickSight analysis - the editing surface"
+    Value: !Sub "domsp-${Environment}-gold-analysis"
+
+  DashboardUrl:
+    Description: "Open the published dashboard"
+    Value: !Sub "https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/domsp-${Environment}-gold-dashboard"

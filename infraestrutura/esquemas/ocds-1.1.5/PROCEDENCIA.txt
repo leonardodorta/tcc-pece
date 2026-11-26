@@ -1,0 +1,20 @@
+Esquemas do Open Contracting Data Standard (OCDS), versao 1.1.5
+
+Arquivos de TERCEIROS, copiados sem modificacao. Servem para validar a exportacao da base
+contra um esquema que nao foi escrito por este trabalho — uma verificacao independente vale
+mais do que conferir o proprio formato com as proprias regras.
+
+Origem:
+  https://standard.open-contracting.org/schema/1__1__5/release-schema.json
+  https://standard.open-contracting.org/schema/1__1__5/release-package-schema.json
+
+Copiados em: 2026-10-10
+Licenca: Open Contracting Partnership publica o padrao sob Apache License 2.0.
+
+Integridade (SHA-256):
+  44a9d8d66001af8e44112b45f5cc7923ee2f40f4790e816f90af1782c5885ee5  release-package-schema.json  (3816 bytes)
+  bf701ac26180756de4c4ada8a94a86a24174f3025345a8b99fda9927de896f80  release-schema.json  (88144 bytes)
+
+O arquivo release-package-schema.json referencia release-schema.json por URL absoluta.
+O validador em src/domsp/contrato/ocds.py resolve essa referencia para a copia local, para
+que a validacao funcione sem rede.

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "domsp"
+version = "1.0.2"
+description = "Extração de atos de contratação do Diário Oficial da Cidade de São Paulo"
+readme = "README.md"
+# Python do Glue 5.0 (3.11). O intervalo é fechado no minor 3.11.
+requires-python = ">=3.11,<3.12"
+
+[tool.setuptools]
+# O pacote mora em src/. `pip install -e .` instala em modo de desenvolvimento, e
+# `python -m build` usa esta seção para gerar a wheel.
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ruff
+# ═══════════════════════════════════════════════════════════════════════════
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+# E/F/W: pycodestyle + pyflakes; I: isort; UP: pyupgrade; B: bugbear; SIM: simplify.
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

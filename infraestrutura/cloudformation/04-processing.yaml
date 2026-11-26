@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "DOM-SP pipeline - the five Glue jobs, one per pipeline stage"
+
+# Os cinco jobs Glue, na ordem que a maquina de estados executa:
+#   download -> bronze -> silver -> (Batch Transform) -> apply_inference -> gold
+# Todos sao glueetl com Glue 5.0 (Spark 3.5.4, Python 3.11).
+
+Parameters:
+  Environment:
+    Type: String
+  ArtifactBucket:
+    Type: String
+  DataLakeBucketName:
+    Type: String
+  DatabaseName:
+    Type: String
+  GlueRoleArn:
+    Type: String
+  WheelName:
+    Type: String
+    Default: "domsp-1.0.0-py3-none-any.whl"
+    Description: "Filename of the domsp wheel under s3://<artifact>/wheel/"
+  WindowFrom:
+    Type: String
+    Default: "tudo"
+    Description: "Window start: yyyy-MM-dd, tudo for no bound, or ultimos:N for the last N days. The download job needs a concrete date or ultimos:N here and a concrete date in WindowTo; tudo is only valid for the stages that read the existing lake"
+  WindowTo:
+    Type: String
+    Default: "tudo"
+    Description: "Window end: yyyy-MM-dd or tudo for no bound. The download job requires a concrete date here, see WindowFrom"
+  FatiasModelo:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 64
+    Description: "Objects the residue is split into - Batch Transform distributes per OBJECT"
+
+Resources:
+
+  DownloadJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "domsp-${Environment}-download"
+      Description: "Downloads Diario Oficial editions for the requested range into the raw prefix"
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      # 120 minutos: o job faz uma requisicao sequencial por dia da janela, a um endpoint
+      # publico sem SLA.
+      Timeout: 120
+      MaxRetries: 1
+      Role: !Ref GlueRoleArn
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ArtifactBucket}/jobs/download.py"
+      DefaultArguments:
+        "--bucket": !Ref DataLakeBucketName
+        "--desde": !Ref WindowFrom
+        "--ate": !Ref WindowTo
+        "--additional-python-modules": !Sub "s3://${ArtifactBucket}/wheel/${WheelName}"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--job-language": python
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  BronzeJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "domsp-${Environment}-bronze"
+      Description: "Parses raw editions into the bronze layer, one typed row per publication"
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 4
+      Timeout: 60
+      MaxRetries: 1
+      Role: !Ref GlueRoleArn
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ArtifactBucket}/jobs/bronze.py"
+      DefaultArguments:
+        "--bucket": !Ref DataLakeBucketName
+        "--database": !Ref DatabaseName
+        "--run_id": "local"
+        "--desde": !Ref WindowFrom
+        "--ate": !Ref WindowTo
+        "--additional-python-modules": !Sub "s3://${ArtifactBucket}/wheel/${WheelName}"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--job-language": python
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  SilverJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "domsp-${Environment}-silver"
+      Description: "Triage plus the three deterministic layers, and the model-input JSONL"
+      GlueVersion: "5.0"
+      # G.2X: este estagio roda expressao regular sobre o HTML de cada publicacao, custo de
+      # CPU e memoria por linha, nao de volume de dado.
+      WorkerType: G.2X
+      NumberOfWorkers: 4
+      Timeout: 60
+      MaxRetries: 1
+      Role: !Ref GlueRoleArn
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ArtifactBucket}/jobs/silver.py"
+      DefaultArguments:
+        "--bucket": !Ref DataLakeBucketName
+        "--database": !Ref DatabaseName
+        "--run_id": "local"
+        "--desde": !Ref WindowFrom
+        "--ate": !Ref WindowTo
+        "--fatias_modelo": !Ref FatiasModelo
+        "--additional-python-modules": !Sub "s3://${ArtifactBucket}/wheel/${WheelName}"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--job-language": python
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  ApplyInferenceJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "domsp-${Environment}-apply-inference"
+      Description: "Applies the model output through the name gate and consolidates contract-final"
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 4
+      Timeout: 60
+      # MaxRetries 0: o modelo e a camada menos precisa; se este estagio falhar, a maquina de
+      # estados segue para o ouro pelo Catch.
+      MaxRetries: 0
+      Role: !Ref GlueRoleArn
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ArtifactBucket}/jobs/apply_inference.py"
+      DefaultArguments:
+        "--bucket": !Ref DataLakeBucketName
+        "--database": !Ref DatabaseName
+        "--run_id": "local"
+        "--model_version": "nenhum"
+        "--additional-python-modules": !Sub "s3://${ArtifactBucket}/wheel/${WheelName}"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--job-language": python
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+  GoldJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "domsp-${Environment}-gold"
+      Description: "Aggregates contract-final into the gold tables and writes the coverage metrics"
+      GlueVersion: "5.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 4
+      Timeout: 60
+      MaxRetries: 1
+      Role: !Ref GlueRoleArn
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ArtifactBucket}/jobs/gold.py"
+      DefaultArguments:
+        "--bucket": !Ref DataLakeBucketName
+        "--database": !Ref DatabaseName
+        "--run_id": "local"
+        "--model_version": "nenhum"
+        "--additional-python-modules": !Sub "s3://${ArtifactBucket}/wheel/${WheelName}"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--job-language": python
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+
+Outputs:
+  DownloadJobName:
+    Value: !Ref DownloadJob
+  BronzeJobName:
+    Value: !Ref BronzeJob
+  SilverJobName:
+    Value: !Ref SilverJob
+  ApplyInferenceJobName:
+    Value: !Ref ApplyInferenceJob
+  GoldJobName:
+    Value: !Ref GoldJob
